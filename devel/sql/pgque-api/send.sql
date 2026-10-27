@@ -130,17 +130,18 @@ end;
 $$ language plpgsql security definer set search_path = pgque, pg_catalog;
 revoke execute on function pgque.send(text, text, text) from public;
 
--- pgque.insert_event_bulk(queue, type, payloads text[]) -- internal set-based primitive
+-- pgque.insert_event_bulk(queue, types, payloads, extras) -- internal set-based primitive
 /* One-pass bulk insert (not insert_event_raw per row); keep its queue lookup
-   and queue_disable_insert replica-bypass in sync with insert_event_raw(). */
+   and queue_disable_insert replica-bypass in sync with insert_event_raw().
+   Arrays are matched by position; a NULL extras array means NULL for every
+   event. */
 create or replace function pgque.insert_event_bulk(
-    queue_name text, ev_type text, ev_data_list text[])
+    queue_name text, ev_types text[], ev_data_list text[],
+    ev_extra1 text[], ev_extra2 text[], ev_extra3 text[], ev_extra4 text[])
 returns bigint[] as $$
 declare
     -- Local aliases avoid ambiguity with table columns inside SQL statements.
     _queue_name alias for $1;
-    _ev_type alias for $2;
-    _ev_data_list alias for $3;
     qstate record;
     v_ids bigint[];
 begin
@@ -166,15 +167,14 @@ begin
 
     execute format($sql$
         with input as materialized (
-            select
-                u.ord,
-                u.payload as ev_data
-            from unnest($2::text[]) with ordinality as u(payload, ord)
+            select u.ord, u.ev_type, u.ev_data, u.e1, u.e2, u.e3, u.e4
+            from unnest($2::text[], $4::text[], $5::text[], $6::text[], $7::text[], $8::text[])
+                with ordinality as u(ev_data, ev_type, e1, e2, e3, e4, ord)
         ), numbered as materialized (
             select
                 ord,
                 nextval($1) as ev_id,
-                ev_data
+                ev_type, ev_data, e1, e2, e3, e4
             from input
             order by ord
         ), ins as (
@@ -184,7 +184,7 @@ begin
             )
             select
                 ev_id, $3, null, null,
-                $4, ev_data, null, null, null, null
+                ev_type, ev_data, e1, e2, e3, e4
             from numbered
             /* Return order comes from array_agg(order by ord) below; this
                just keeps physical insertion roughly aligned with input. */
@@ -196,9 +196,21 @@ begin
         join ins using (ev_id)
     $sql$, qstate.cur_table_name)
     into v_ids
-    using qstate.queue_event_seq, _ev_data_list, now(), _ev_type;
+    using qstate.queue_event_seq, ev_data_list, now(), ev_types,
+          ev_extra1, ev_extra2, ev_extra3, ev_extra4;
 
     return v_ids;
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+-- pgque.insert_event_bulk(queue, type, payloads text[]) -- one type, no extras
+create or replace function pgque.insert_event_bulk(
+    queue_name text, ev_type text, ev_data_list text[])
+returns bigint[] as $$
+begin
+    return pgque.insert_event_bulk(queue_name,
+        array_fill(ev_type, array[cardinality(ev_data_list)]), ev_data_list,
+        null, null, null, null);
 end;
 $$ language plpgsql security definer set search_path = pgque, pg_catalog;
 
@@ -253,6 +265,38 @@ begin
 end;
 $$ language plpgsql security definer set search_path = pgque, pg_catalog;
 revoke execute on function pgque.send_batch(text, text, text[]) from public;
+
+-- pgque.send_batch(queue, types, payloads, extra1..4) -- per-event type and extras
+/* One type per event, and optional ev_extra1..4 arrays (NULL for none),
+   matched to payloads by position. Partition keys use ev_extra1. */
+create or replace function pgque.send_batch(
+    queue_name text, type_names text[], payloads jsonb[],
+    extra1 text[], extra2 text[], extra3 text[], extra4 text[])
+returns bigint[] as $$
+declare
+    v_n int := cardinality(payloads);
+begin
+    if payloads is null then
+        raise exception 'payloads must not be null';
+    end if;
+    if v_n = 0 then
+        return '{}'::bigint[];
+    end if;
+    if cardinality(type_names) is distinct from v_n then
+        raise exception 'type_names must have one entry per payload';
+    end if;
+    if (extra1 is not null and cardinality(extra1) <> v_n)
+       or (extra2 is not null and cardinality(extra2) <> v_n)
+       or (extra3 is not null and cardinality(extra3) <> v_n)
+       or (extra4 is not null and cardinality(extra4) <> v_n) then
+        raise exception 'extras arrays must be NULL or have one entry per payload';
+    end if;
+
+    return pgque.insert_event_bulk(queue_name, type_names, payloads::text[],
+        extra1, extra2, extra3, extra4);
+end;
+$$ language plpgsql security definer set search_path = pgque, pg_catalog;
+revoke execute on function pgque.send_batch(text, text[], jsonb[], text[], text[], text[], text[]) from public;
 
 -- pgque.subscribe(queue, consumer) -- wrapper for register_consumer
 create or replace function pgque.subscribe(queue text, consumer text)
@@ -327,6 +371,7 @@ grant execute on function pgque.send_batch(text, jsonb[])       to pgque_writer;
 grant execute on function pgque.send_batch(text, text[])        to pgque_writer;
 grant execute on function pgque.send_batch(text, text, jsonb[]) to pgque_writer;
 grant execute on function pgque.send_batch(text, text, text[])  to pgque_writer;
+grant execute on function pgque.send_batch(text, text[], jsonb[], text[], text[], text[], text[]) to pgque_writer;
 /* Revoke before re-granting on pgque_reader: create or replace preserves
    function-level grants, so an in-place upgrade must clear the old writer
    grant explicitly. */
@@ -339,6 +384,8 @@ grant execute on function pgque.unsubscribe(text, text)         to pgque_reader;
    granted to pgque_admin (it inherits pgque_writer): writers enter through the
    audited send_batch() wrappers, not this low-level primitive. */
 revoke execute on function pgque.insert_event_bulk(text, text, text[])
+    from public, pgque_reader, pgque_writer, pgque_admin;
+revoke execute on function pgque.insert_event_bulk(text, text[], text[], text[], text[], text[], text[])
     from public, pgque_reader, pgque_writer, pgque_admin;
 
 /* Re-apply deny-by-default: roles.sql's blanket revoke runs before the
