@@ -26,18 +26,25 @@ create index if not exists de_deliver_idx
 -- and returns the queue event ID.
 -- If i_deliver_at is in the future, inserts into delayed_events
 -- and returns the scheduled-entry ID (NOT a queue event ID).
+-- The extras become the event's ev_extra1..4 when it is delivered.
+drop function if exists pgque.send_at(text, text, jsonb, timestamptz);
 create or replace function pgque.send_at(
-    i_queue text, i_type text, i_payload jsonb, i_deliver_at timestamptz)
+    i_queue text, i_type text, i_payload jsonb, i_deliver_at timestamptz,
+    i_extra1 text default null, i_extra2 text default null,
+    i_extra3 text default null, i_extra4 text default null)
 returns bigint as $$
 begin
     if i_deliver_at <= now() then
         -- Deliver immediately; returns queue event ID
-        return pgque.insert_event(i_queue, i_type, i_payload::text);
+        return pgque.insert_event(i_queue, i_type, i_payload::text,
+            i_extra1, i_extra2, i_extra3, i_extra4);
     end if;
 
     insert into pgque.delayed_events
-        (de_queue_name, de_deliver_at, de_type, de_data)
-    values (i_queue, i_deliver_at, i_type, i_payload::text);
+        (de_queue_name, de_deliver_at, de_type, de_data,
+         de_extra1, de_extra2, de_extra3, de_extra4)
+    values (i_queue, i_deliver_at, i_type, i_payload::text,
+            i_extra1, i_extra2, i_extra3, i_extra4);
 
     -- Returns scheduled-entry ID (NOT a queue event ID)
     return currval('pgque.delayed_events_de_id_seq');
@@ -143,10 +150,10 @@ $$ language plpgsql security definer set search_path = pgque, pg_catalog;
 -- functions are executable by PUBLIC by default. send_at is a producer
 -- call; delivery and maint() stay with pgque_admin, which has execute on
 -- all functions.
-revoke execute on function pgque.send_at(text, text, jsonb, timestamptz) from public;
+revoke execute on function pgque.send_at(text, text, jsonb, timestamptz, text, text, text, text) from public;
 revoke execute on function pgque.maint_deliver_delayed() from public;
 revoke execute on function pgque.maint() from public;
-grant execute on function pgque.send_at(text, text, jsonb, timestamptz) to pgque_writer;
+grant execute on function pgque.send_at(text, text, jsonb, timestamptz, text, text, text, text) to pgque_writer;
 grant execute on function pgque.maint_deliver_delayed() to pgque_admin;
 grant execute on function pgque.maint() to pgque_admin;
 revoke all on table pgque.delayed_events from public;

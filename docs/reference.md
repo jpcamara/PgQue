@@ -106,9 +106,21 @@ Grant: `pgque_writer`. Source: [`devel/sql/pgque-api/send.sql`](https://github.c
 Set-based fast-path batch send for opaque text payloads. Returns event ids aligned to input order. Do not rely on the numeric ids being monotonically increasing inside one batch; use array position for input/result correlation. Empty arrays return `{}` without queue lookup; `NULL` arrays raise `payloads must not be null`. Non-empty batches still validate queue state once up front: unknown queues raise `queue not found: <queue>`, and write-disabled queues raise `Insert into queue disallowed`. NULL elements inside a non-null array are stored as NULL `ev_data`.
 Grant: `pgque_writer`. Source: [`devel/sql/pgque-api/send.sql`](https://github.com/NikolayS/pgque/blob/main/devel/sql/pgque-api/send.sql).
 
+#### `pgque.send_batch(queue_name text, type_names text[], payloads jsonb[], extra1 text[], extra2 text[], extra3 text[], extra4 text[]) → bigint[]`
+
+Batch send with a type per event and optional `ev_extra1`..`ev_extra4` values, matched to `payloads` by position. Pass `NULL` for an extras array to leave that column `NULL` on every event; otherwise each array must have one entry per payload, as must `type_names`, or it raises. As fast as the single-type form. Partition keys use `ev_extra1`. All seven arguments are required, so three-argument calls keep resolving to the single-type form.
+Grant: `pgque_writer`. Source: [`devel/sql/pgque-api/send.sql`](https://github.com/NikolayS/pgque/blob/main/devel/sql/pgque-api/send.sql).
+
+```sql
+select pgque.send_batch('jobs',
+  array['SendInvoiceJob', 'SendReceiptJob'],
+  array['{"id": 1}', '{"id": 2}']::jsonb[],
+  null, array['batch-7', 'batch-7'], null, null);
+```
+
 #### `pgque.insert_event_bulk(queue_name text, ev_type text, ev_data_list text[]) → bigint[]`
 
-**Not directly callable by API roles.** Internal set-based primitive used by `send_batch`: resolves the queue/table once, allocates ids from the queue sequence, inserts all payloads with one `INSERT … SELECT`, and returns ids aligned to input order. It is `SECURITY DEFINER` so the public wrappers can use it, but EXECUTE is revoked from public API roles (including `pgque_admin`) to keep callers on the stable `send_batch` surface. The schema owner/superuser can still call it for install/debug work.
+**Not directly callable by API roles.** Internal set-based primitives used by `send_batch`; this form delegates to `pgque.insert_event_bulk(queue_name, ev_types text[], ev_data_list text[], ev_extra1 text[], ev_extra2 text[], ev_extra3 text[], ev_extra4 text[])`, which takes a type and extras per event. That form resolves the queue/table once, allocates ids from the queue sequence, inserts all payloads with one `INSERT … SELECT`, and returns ids aligned to input order. It is `SECURITY DEFINER` so the public wrappers can use it, but EXECUTE is revoked from public API roles (including `pgque_admin`) to keep callers on the stable `send_batch` surface. The schema owner/superuser can still call it for install/debug work.
 Grant: none (internal). Source: [`devel/sql/pgque-api/send.sql`](https://github.com/NikolayS/pgque/blob/main/devel/sql/pgque-api/send.sql).
 
 ## Consuming
@@ -672,9 +684,9 @@ These objects are not part of [`devel/sql/pgque.sql`](https://github.com/Nikolay
 
 ### [`devel/sql/experimental/delayed.sql`](https://github.com/NikolayS/pgque/blob/main/devel/sql/experimental/delayed.sql)
 
-#### `pgque.send_at(queue text, type text, payload jsonb, deliver_at timestamptz) → bigint`
+#### `pgque.send_at(queue text, type text, payload jsonb, deliver_at timestamptz, extra1 text default null, extra2 text default null, extra3 text default null, extra4 text default null) → bigint`
 
-Schedules delayed delivery. If `deliver_at <= now()` behaves like `insert_event` and returns the queue event id. Otherwise inserts into `pgque.delayed_events` and returns the scheduled-entry id (**not** a queue event id).
+Schedules delayed delivery. If `deliver_at <= now()` behaves like `insert_event` and returns the queue event id. Otherwise inserts into `pgque.delayed_events` and returns the scheduled-entry id (**not** a queue event id). The extras become the event's `ev_extra1`..`ev_extra4`.
 Grant: `pgque_writer`.
 
 #### `pgque.maint_deliver_delayed() → integer`

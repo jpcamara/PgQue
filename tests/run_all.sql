@@ -151,6 +151,9 @@
 \echo 'Running: test_send_idem'
 \i tests/test_send_idem.sql
 
+\echo 'Running: test_send_batch_extras'
+\i tests/test_send_batch_extras.sql
+
 \echo 'Running: test_is_processed'
 \i tests/test_is_processed.sql
 

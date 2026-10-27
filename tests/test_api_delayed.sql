@@ -133,13 +133,13 @@ end $$;
 -- this file, so the file revokes its own functions.
 do $$
 begin
-  assert not has_function_privilege('public', 'pgque.send_at(text, text, jsonb, timestamptz)', 'execute'),
+  assert not has_function_privilege('public', 'pgque.send_at(text, text, jsonb, timestamptz, text, text, text, text)', 'execute'),
     'PUBLIC must not execute send_at';
   assert not has_function_privilege('public', 'pgque.maint_deliver_delayed()', 'execute'),
     'PUBLIC must not execute maint_deliver_delayed';
   assert not has_function_privilege('public', 'pgque.maint()', 'execute'),
     'PUBLIC must not execute maint';
-  assert has_function_privilege('pgque_writer', 'pgque.send_at(text, text, jsonb, timestamptz)', 'execute'),
+  assert has_function_privilege('pgque_writer', 'pgque.send_at(text, text, jsonb, timestamptz, text, text, text, text)', 'execute'),
     'pgque_writer executes send_at';
   assert not has_function_privilege('pgque_writer', 'pgque.maint_deliver_delayed()', 'execute'),
     'pgque_writer must not execute maint_deliver_delayed';
@@ -148,4 +148,46 @@ begin
   assert has_function_privilege('pgque_admin', 'pgque.maint()', 'execute'),
     'pgque_admin executes maint';
   raise notice 'PASS: delayed.sql functions are not executable by PUBLIC';
+end $$;
+
+-- Test 6: extras are kept through delivery, and used for immediate sends.
+-- Separate statements: a tick only sees committed events.
+do $$
+begin
+  perform pgque.create_queue('test_delayed_extras');
+  perform pgque.register_consumer('test_delayed_extras', 'c1');
+  perform pgque.send_at('test_delayed_extras', 'later', '{}'::jsonb,
+    now() + interval '1 hour', null, 'x2', null, 'x4');
+  perform pgque.send_at('test_delayed_extras', 'now', '{}'::jsonb,
+    now() - interval '1 second', 'n1', null, null, null);
+  update pgque.delayed_events set de_deliver_at = now() - interval '1 second'
+  where de_queue_name = 'test_delayed_extras';
+end $$;
+
+select pgque.maint_deliver_delayed();
+select pgque.force_next_tick('test_delayed_extras');
+select pgque.ticker();
+
+do $$
+declare
+  v_batch_id bigint;
+  v_ev record;
+  v_seen int := 0;
+begin
+  v_batch_id := pgque.next_batch('test_delayed_extras', 'c1');
+  for v_ev in select * from pgque.get_batch_events(v_batch_id) loop
+    if v_ev.ev_type = 'later' then
+      assert v_ev.ev_extra1 is null and v_ev.ev_extra2 = 'x2' and v_ev.ev_extra4 = 'x4',
+        'delivered event keeps its extras';
+    else
+      assert v_ev.ev_extra1 = 'n1', 'immediate send keeps its extras';
+    end if;
+    v_seen := v_seen + 1;
+  end loop;
+  assert v_seen = 2, 'expected 2 events, got ' || v_seen;
+  perform pgque.finish_batch(v_batch_id);
+
+  perform pgque.unregister_consumer('test_delayed_extras', 'c1');
+  perform pgque.drop_queue('test_delayed_extras');
+  raise notice 'PASS: send_at() keeps extras through delivery';
 end $$;
