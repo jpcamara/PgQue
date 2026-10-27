@@ -1005,6 +1005,7 @@ DEFAULT_API_FILES=(
   send.sql
   partition_keys.sql
   send_idem.sql
+  processed.sql
 )
 
 for api_name in "${DEFAULT_API_FILES[@]}"; do

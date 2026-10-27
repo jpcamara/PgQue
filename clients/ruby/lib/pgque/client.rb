@@ -160,6 +160,19 @@ module Pgque
       )
     end
 
+    # Whether the consumer has processed (acked or nacked) every event the
+    # transaction sent to the queue. Capture txid in the sending
+    # transaction with `select pg_current_xact_id()`.
+    def processed?(queue, consumer, txid)
+      result = @conn.exec_params(
+        "select pgque.is_processed($1, $2, $3::xid8)",
+        [queue, consumer, txid.to_s],
+      )
+      result.getvalue(0, 0) == "t"
+    rescue PG::Error => e
+      raise_wrapped_sql_error(e)
+    end
+
     def touch_subconsumer(queue, consumer, subconsumer)
       result = @conn.exec_params(
         "select pgque.touch_subconsumer($1, $2, $3)",

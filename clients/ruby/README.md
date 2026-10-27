@@ -180,6 +180,25 @@ client.unsubscribe_subconsumer(
 if the subconsumer holds an active batch; pass `batch_handling: 1` to
 route active messages through retry/DLQ before removal.
 
+## Waiting for your sends
+
+`Client#processed?` tells whether a consumer has processed (acked or
+nacked) every event a transaction sent. Capture the transaction id when
+sending:
+
+```ruby
+txid = conn.transaction do
+  client.send("orders", { "id" => 42 }, type: "order.created")
+  conn.exec("select pg_current_xact_id()").getvalue(0, 0)
+end
+
+client.processed?("orders", "order_worker", txid) # => true once handled
+```
+
+It wraps `pgque.is_processed()`; see
+[`docs/reference.md`](../../docs/reference.md) for how it treats
+cooperative and partitioned consumers.
+
 ## Manual ticking
 
 For tests, demos, or manual operation without `pg_cron`, use
