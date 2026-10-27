@@ -8,6 +8,9 @@ module Pgque
   class Consumer
     DEFAULT_MAX_MESSAGES = 2_147_483_647
     WAIT_SLICE_SECONDS = 0.5
+    # A cooperative member that has held a batch this long without a
+    # heartbeat is treated as dead, and another member takes the batch.
+    DEFAULT_DEAD_INTERVAL = "60 seconds"
 
     NackFailed = Class.new(StandardError)
     private_constant :NackFailed
@@ -41,7 +44,7 @@ module Pgque
               "(set subconsumer:)"
       end
       @subconsumer = subconsumer
-      @dead_interval = dead_interval
+      @dead_interval = dead_interval || (subconsumer && DEFAULT_DEAD_INTERVAL)
 
       @handlers = {}
       @default_handler = nil
@@ -160,7 +163,7 @@ module Pgque
       batch_id = msgs[0].batch_id
       @logger.debug("batch #{batch_id}: #{msgs.size} message(s)")
 
-      failures = dispatch_batch(msgs)
+      failures = with_heartbeat(conn) { dispatch_batch(msgs) }
 
       # Nacks and the ack commit together. If a nack fails, the nacks
       # before it roll back and the batch stays open, so the whole batch
@@ -218,6 +221,45 @@ module Pgque
         end
       end
       failures
+    end
+
+    # The claimed batch is committed before the handlers run, so a crashed
+    # member's batch is recovered by dead_interval takeover. While the
+    # handlers run, refresh this member's sub_active so a live member's
+    # batch is not taken over. The handlers don't use conn, so the
+    # heartbeat thread has it to itself until it is joined.
+    def with_heartbeat(conn)
+      return yield unless @subconsumer
+
+      @heartbeat_seconds ||= conn.exec_params(
+        "select extract(epoch from $1::interval) / 4", [@dead_interval]
+      ).getvalue(0, 0).to_f
+      lock = Mutex.new
+      wake = ConditionVariable.new
+      finished = false
+      beat = Thread.new do
+        lock.synchronize do
+          until finished
+            wake.wait(lock, @heartbeat_seconds)
+            touch(conn) unless finished
+          end
+        end
+      end
+      yield
+    ensure
+      if beat
+        lock.synchronize do
+          finished = true
+          wake.signal
+        end
+        beat.join
+      end
+    end
+
+    def touch(conn)
+      Client.new(conn).touch_subconsumer(@queue, @name, @subconsumer)
+    rescue StandardError => e
+      @logger.error("heartbeat failed: #{e.class}: #{e.message}")
     end
 
     def nack(client, batch_id, msg, reason)

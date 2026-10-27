@@ -147,7 +147,7 @@ c1 = Pgque::Consumer.new(
   queue: "orders",
   name: "order_worker",
   subconsumer: "worker-1",
-  dead_interval: "5 minutes",  # optional: take over a stale sibling
+  dead_interval: "5 minutes",  # optional, default 60 seconds
 )
 
 c1.on("order.created") { |msg| process(msg) }
@@ -156,9 +156,14 @@ c1.start  # in a second process: subconsumer: "worker-2"
 ```
 
 `Consumer.new(subconsumer: ...)` switches the poll loop to
-`receive_coop` and uses the cooperative cursor. `dead_interval:` is
-only valid in cooperative mode; passing it without `subconsumer:`
-raises `ArgumentError`.
+`receive_coop` and uses the cooperative cursor. A subconsumer that
+holds a batch for longer than `dead_interval:` without a heartbeat is
+treated as dead, and another subconsumer takes over its batch. While
+handlers run, the consumer refreshes its heartbeat with
+`touch_subconsumer` every quarter of `dead_interval`, so a long batch
+on a live worker is not taken over. `dead_interval:` is only valid in
+cooperative mode; passing it without `subconsumer:` raises
+`ArgumentError`.
 
 The low-level methods on `Pgque::Client` are also available for direct
 use:
