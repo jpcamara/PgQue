@@ -49,36 +49,40 @@ begin
         raise exception 'consumer % is a partition slot consumer; use pgque.receive_partitioned()', i_consumer;
     end if;
 
-    -- Get next batch (may return NULL if no tick window is ready)
-    v_batch_id := pgque.next_batch(i_queue, i_consumer);
-    if v_batch_id is null then
-        return;
-    end if;
-
-    -- Yield messages from the batch
-    for ev in
-        select ev_id, ev_type, ev_data, ev_retry, ev_time,
-               ev_extra1, ev_extra2, ev_extra3, ev_extra4
-        from pgque.get_batch_events(v_batch_id)
     loop
-        if cnt = i_max_return then
-            raise exception 'pgque.receive: batch exceeds max_return of %', i_max_return
-                using
-                    errcode = '54000',
-                    hint = 'Retry with a larger resource-safe max_return to receive the complete batch. Do not acknowledge after this error.';
+        -- Get next batch (may return NULL if no tick window is ready)
+        v_batch_id := pgque.next_batch(i_queue, i_consumer);
+        if v_batch_id is null then
+            return;
         end if;
-        return next row(
-            ev.ev_id, v_batch_id, ev.ev_type, ev.ev_data,
-            ev.ev_retry, ev.ev_time,
-            ev.ev_extra1, ev.ev_extra2, ev.ev_extra3, ev.ev_extra4
-        )::pgque.message;
-        cnt := cnt + 1;
-    end loop;
 
-    -- Empty batch: finish immediately to advance the consumer cursor.
-    if cnt = 0 then
+        -- Yield messages from the batch
+        for ev in
+            select ev_id, ev_type, ev_data, ev_retry, ev_time,
+                   ev_extra1, ev_extra2, ev_extra3, ev_extra4
+            from pgque.get_batch_events(v_batch_id)
+        loop
+            if cnt = i_max_return then
+                raise exception 'pgque.receive: batch exceeds max_return of %', i_max_return
+                    using
+                        errcode = '54000',
+                        hint = 'Retry with a larger resource-safe max_return to receive the complete batch. Do not acknowledge after this error.';
+            end if;
+            return next row(
+                ev.ev_id, v_batch_id, ev.ev_type, ev.ev_data,
+                ev.ev_retry, ev.ev_time,
+                ev.ev_extra1, ev.ev_extra2, ev.ev_extra3, ev.ev_extra4
+            )::pgque.message;
+            cnt := cnt + 1;
+        end loop;
+        exit when cnt > 0;
+
+        -- Empty batch: finish it to advance the consumer cursor, and move
+        -- on to the next batch. Returning no rows here would look the same
+        -- as "no batch ready", and the caller would wait to poll again
+        -- while a later batch is ready.
         perform pgque.finish_batch(v_batch_id);
-    end if;
+    end loop;
 
     return;
 end;
