@@ -552,4 +552,32 @@ class TestConsumerIntegration < Minitest::Test
       assert_empty client.receive(queue, consumer_n, 10)
     end
   end
+
+  def test_consumer_start_keeps_its_threads_between_batches
+    with_queue do |queue, consumer_n, conn|
+      client = Pgque::Client.new(conn)
+      2.times do |batch|
+        4.times { |i| client.send(queue, { "i" => i }, type: "evt") }
+        force_tick(conn, queue) if batch == 0
+      end
+      threads_before = Thread.list.size
+
+      seen = Queue.new
+      cons = Pgque::Consumer.new(dsn, queue: queue, name: consumer_n,
+                                 poll_interval: 1, threads: 3,
+                                 logger: silent_logger)
+      cons.on("evt") { |_| seen << Thread.current }
+      runner = Thread.new { cons.start }
+      sleep 0.1 until seen.size == 4
+      force_tick(conn, queue)
+      sleep 0.1 until seen.size == 8
+      cons.stop
+      runner.join(5)
+
+      handler_threads = Array.new(seen.size) { seen.pop }.uniq
+      assert_operator handler_threads.size, :<=, 3
+      refute_includes handler_threads, runner
+      assert_equal threads_before, Thread.list.size
+    end
+  end
 end

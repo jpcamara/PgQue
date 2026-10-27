@@ -107,6 +107,10 @@ module Pgque
       end
 
       begin
+        if @threads > 1
+          @pool = Queue.new
+          pool_threads = run_pool(@pool, @threads)
+        end
         conn = PG.connect(@dsn)
         begin
           channel = "pgque_#{@queue}"
@@ -137,6 +141,9 @@ module Pgque
         # ghost "running" with no live worker. Plain instance-var
         # write -- not the trap-context-unsafe pattern.
         @running = false
+        @pool&.close
+        pool_threads&.each(&:join)
+        @pool = nil
         if in_main_thread
           original_handlers.each { |sig, h| Signal.trap(sig, h || "DEFAULT") }
         end
@@ -205,23 +212,30 @@ module Pgque
     # Runs the handlers and returns the messages to nack, each with the
     # nack reason (nil for a handler error). With threads > 1, the
     # messages run on that many threads, and the batch is done when they
-    # all finish.
+    # all finish. Inside start the threads are kept between batches;
+    # a direct poll_once starts them for the batch.
     def dispatch_batch(msgs)
       return msgs.filter_map { |msg| dispatch(msg) } if @threads == 1 || msgs.size == 1
 
-      pending = Queue.new
-      msgs.each { |msg| pending << msg }
-      pending.close
       failures = Queue.new
-      Array.new([@threads, msgs.size].min) do
-        Thread.new do
-          while (msg = pending.pop)
-            failure = dispatch(msg)
-            failures << failure if failure
-          end
+      done = Queue.new
+      jobs = @pool || Queue.new
+      msgs.each do |msg|
+        jobs << -> do
+          failure = dispatch(msg)
+          failures << failure if failure
+        ensure
+          done << true
         end
-      end.each(&:join)
+      end
+      run_pool(jobs.close, [@threads, msgs.size].min) unless @pool
+      msgs.size.times { done.pop }
       Array.new(failures.size) { failures.pop }
+    end
+
+    # Starts threads that run the jobs on queue until it is closed.
+    def run_pool(queue, size)
+      Array.new(size) { Thread.new { while (job = queue.pop) do job.call end } }
     end
 
     # Runs the handler for one message. Returns [msg, reason] if the
