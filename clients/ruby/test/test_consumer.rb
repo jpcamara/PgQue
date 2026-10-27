@@ -60,6 +60,40 @@ class TestConsumerUnit < Minitest::Test
     assert_equal [["q", "c", 123]], spy.receive_calls
   end
 
+  class NackFailsClient
+    attr_reader :acks
+
+    def initialize(*)
+      @acks = []
+    end
+
+    def receive(*)
+      [Pgque::Message.new(msg_id: 1, batch_id: 7, type: "boom",
+                          payload: nil, retry_count: nil, created_at: nil)]
+    end
+
+    def nack(*)
+      raise Pgque::Error, "nack failed"
+    end
+
+    def ack(batch_id)
+      @acks << batch_id
+      1
+    end
+  end
+
+  def test_consumer_poll_once_leaves_batch_open_when_nack_fails
+    cons = Pgque::Consumer.new(dsn, queue: "q", name: "c",
+                               logger: Logger.new(StringIO.new))
+    cons.on("boom") { |_| raise "handler boom" }
+    client = NackFailsClient.new
+    handled = Pgque::Client.stub :new, ->(*) { client } do
+      cons.poll_once(FakeTxConn.new)
+    end
+    refute handled, "a batch that was not acked must not count as handled"
+    assert_equal [], client.acks
+  end
+
   def test_consumer_rejects_invalid_unknown_handler_policy
     skip_dsn_for_this_class!
     assert_raises(ArgumentError) do
@@ -354,6 +388,32 @@ class TestConsumerIntegration < Minitest::Test
       assert_equal 1, received.size
       assert_operator elapsed, :<, 5.0,
                       "consumer woke too slowly (#{elapsed.round(2)}s)"
+    end
+  end
+
+  def test_consumer_drains_ready_batches_without_waiting_for_poll
+    with_queue do |queue, consumer_n, conn|
+      client = Pgque::Client.new(conn)
+      client.send(queue, { "i" => 1 }, type: "evt.backlog")
+      force_tick(conn, queue)
+      client.send(queue, { "i" => 2 }, type: "evt.backlog")
+      force_tick(conn, queue)
+
+      # Both ticks fired before the consumer started listening, so no
+      # NOTIFY will arrive. The second batch must still be picked up
+      # well before the 30 s poll.
+      seen = []
+      cons = Pgque::Consumer.new(dsn, queue: queue, name: consumer_n,
+                                 poll_interval: 30, logger: silent_logger)
+      cons.on("evt.backlog") { |m| seen << m.payload["i"] }
+      t = Thread.new { cons.start }
+
+      deadline = Time.now + 5
+      sleep 0.05 until seen.size == 2 || Time.now >= deadline
+      cons.stop
+      t.join(5.0)
+
+      assert_equal [1, 2], seen
     end
   end
 

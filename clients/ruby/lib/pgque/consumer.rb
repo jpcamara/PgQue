@@ -9,6 +9,9 @@ module Pgque
     DEFAULT_MAX_MESSAGES = 2_147_483_647
     WAIT_SLICE_SECONDS = 0.5
 
+    NackFailed = Class.new(StandardError)
+    private_constant :NackFailed
+
     attr_reader :dsn, :queue, :name, :poll_interval, :max_messages,
                 :retry_after, :subconsumer, :dead_interval
 
@@ -96,9 +99,11 @@ module Pgque
           )
 
           while running?
-            poll_once(conn)
+            handled = poll_once(conn)
             break unless running?
-            wait_for_notify_or_stop(conn)
+            # More batches may be ready. Their NOTIFYs fired while the
+            # handlers ran, so receive again instead of waiting.
+            wait_for_notify_or_stop(conn) unless handled
           end
 
           if @stop_signum
@@ -131,29 +136,39 @@ module Pgque
     end
 
     # Public for testability; not part of the stable API.
+    #
+    # Returns true when it handled and acked a batch.
     def poll_once(conn)
+      client = Client.new(conn)
+      # receive runs in its own transaction. In cooperative mode
+      # receive_coop locks the logical consumer's row, and committing
+      # here releases it before the handlers run, so other subconsumers
+      # can claim batches in the meantime. The claimed batch stays open
+      # until ack.
+      msgs =
+        if @subconsumer
+          client.receive_coop(
+            @queue, @name, @subconsumer,
+            max_messages: @max_messages,
+            dead_interval: @dead_interval,
+          )
+        else
+          client.receive(@queue, @name, @max_messages)
+        end
+      return false if msgs.empty?
+
+      batch_id = msgs[0].batch_id
+      @logger.debug("batch #{batch_id}: #{msgs.size} message(s)")
+
+      failures = dispatch_batch(msgs)
+
+      # Nacks and the ack commit together. If a nack fails, the nacks
+      # before it roll back and the batch stays open, so the whole batch
+      # is delivered again.
       conn.transaction do
-        client = Client.new(conn)
-        msgs =
-          if @subconsumer
-            client.receive_coop(
-              @queue, @name, @subconsumer,
-              max_messages: @max_messages,
-              dead_interval: @dead_interval,
-            )
-          else
-            client.receive(@queue, @name, @max_messages)
-          end
-
-        next if msgs.empty?
-
-        batch_id = msgs[0].batch_id
-        @logger.debug("batch #{batch_id}: #{msgs.size} message(s)")
-
-        nack_failed = dispatch_batch(client, batch_id, msgs)
-
-        next if nack_failed
-
+        failures.each do |msg, reason|
+          raise NackFailed unless nack(client, batch_id, msg, reason)
+        end
         rowcount = client.ack(batch_id)
         if rowcount == 0
           @logger.warn(
@@ -162,12 +177,17 @@ module Pgque
           )
         end
       end
+      true
+    rescue NackFailed
+      false
     end
 
     private
 
-    def dispatch_batch(client, batch_id, msgs)
-      nack_failed = false
+    # Runs the handlers and returns the messages to nack, each with the
+    # nack reason (nil for a handler error).
+    def dispatch_batch(msgs)
+      failures = []
       msgs.each do |msg|
         handler = @handlers[msg.type] || @default_handler
 
@@ -183,16 +203,7 @@ module Pgque
             "no handler for event type=#{msg.type} ev_id=#{msg.msg_id}; " \
             "nacking",
           )
-          begin
-            client.nack(batch_id, msg, retry_after: @retry_after,
-                        reason: "no handler for type=#{msg.type}")
-          rescue StandardError => e
-            nack_failed = true
-            @logger.error(
-              "nack failed for unhandled msg_id=#{msg.msg_id}: " \
-              "#{e.class}: #{e.message}",
-            )
-          end
+          failures << [msg, "no handler for type=#{msg.type}"]
           next
         end
 
@@ -203,18 +214,21 @@ module Pgque
             "handler failed for msg_id=#{msg.msg_id}: " \
             "#{e.class}: #{e.message}",
           )
-          begin
-            client.nack(batch_id, msg, retry_after: @retry_after)
-          rescue StandardError => e2
-            nack_failed = true
-            @logger.error(
-              "nack failed for msg_id=#{msg.msg_id}: " \
-              "#{e2.class}: #{e2.message}",
-            )
-          end
+          failures << [msg, nil]
         end
       end
-      nack_failed
+      failures
+    end
+
+    def nack(client, batch_id, msg, reason)
+      client.nack(batch_id, msg, retry_after: @retry_after, reason: reason)
+      true
+    rescue StandardError => e
+      @logger.error(
+        "nack failed for #{reason ? "unhandled " : ""}msg_id=#{msg.msg_id}: " \
+        "#{e.class}: #{e.message}",
+      )
+      false
     end
 
     def wait_for_notify_or_stop(conn)

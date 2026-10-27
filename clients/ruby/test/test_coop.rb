@@ -233,6 +233,43 @@ class TestCoop < Minitest::Test
     end
   end
 
+  def test_coop_subconsumers_handle_batches_concurrently
+    with_coop_queue do |q, conn|
+      client = Pgque::Client.new(conn)
+      workers = %w[worker-1 worker-2]
+      workers.each { |w| client.subscribe_subconsumer(q, consumer_n, w) }
+      client.send(q, { "i" => 1 }, type: "evt.slow")
+      tick(conn, q)
+      client.send(q, { "i" => 2 }, type: "evt.slow")
+      tick(conn, q)
+
+      # Each handler waits until released, so both batches are in flight
+      # at once only if one subconsumer can claim a batch while the other
+      # is still handling its own.
+      started = Queue.new
+      release = Queue.new
+      consumers = workers.map do |w|
+        cons = Pgque::Consumer.new(dsn, queue: q, name: consumer_n,
+                                   subconsumer: w, poll_interval: 1,
+                                   logger: silent_logger)
+        cons.on("evt.slow") { |m| started << m.payload["i"]; release.pop }
+        cons
+      end
+      threads = consumers.map { |c| Thread.new { c.start } }
+
+      deadline = Time.now + 5
+      sleep 0.05 until started.size == 2 || Time.now >= deadline
+      concurrent = started.size
+      2.times { release << true }
+      consumers.each(&:stop)
+      threads.each { |t| t.join(5.0) }
+
+      assert_equal 2, concurrent,
+                   "second subconsumer could not claim a batch while the " \
+                   "first was handling one"
+    end
+  end
+
   def test_consumer_without_subconsumer_unchanged
     with_queue do |queue, c_name, conn|
       client = Pgque::Client.new(conn)
