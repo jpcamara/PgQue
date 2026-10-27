@@ -233,6 +233,119 @@ class TestCoop < Minitest::Test
     end
   end
 
+  def test_coop_subconsumers_handle_batches_concurrently
+    with_coop_queue do |q, conn|
+      client = Pgque::Client.new(conn)
+      workers = %w[worker-1 worker-2]
+      workers.each { |w| client.subscribe_subconsumer(q, consumer_n, w) }
+      client.send(q, { "i" => 1 }, type: "evt.slow")
+      tick(conn, q)
+      client.send(q, { "i" => 2 }, type: "evt.slow")
+      tick(conn, q)
+
+      # Each handler waits until released, so both batches are in flight
+      # at once only if one subconsumer can claim a batch while the other
+      # is still handling its own.
+      started = Queue.new
+      release = Queue.new
+      consumers = workers.map do |w|
+        cons = Pgque::Consumer.new(dsn, queue: q, name: consumer_n,
+                                   subconsumer: w, poll_interval: 1,
+                                   logger: silent_logger)
+        cons.on("evt.slow") { |m| started << m.payload["i"]; release.pop }
+        cons
+      end
+      threads = consumers.map { |c| Thread.new { c.start } }
+
+      deadline = Time.now + 5
+      sleep 0.05 until started.size == 2 || Time.now >= deadline
+      concurrent = started.size
+      2.times { release << true }
+      consumers.each(&:stop)
+      threads.each { |t| t.join(5.0) }
+
+      assert_equal 2, concurrent,
+                   "second subconsumer could not claim a batch while the " \
+                   "first was handling one"
+    end
+  end
+
+  def test_consumer_coop_defaults_dead_interval
+    cons = Pgque::Consumer.new(dsn, queue: "q", name: "c",
+                               subconsumer: "worker-1")
+    assert_equal "60 seconds", cons.dead_interval
+  end
+
+  def test_consumer_coop_heartbeat_keeps_long_batch_from_takeover
+    with_coop_queue do |q, conn|
+      client = Pgque::Client.new(conn)
+      %w[worker-1 thief].each { |w| client.subscribe_subconsumer(q, consumer_n, w) }
+      client.send(q, { "i" => 1 }, type: "evt.long")
+      tick(conn, q)
+
+      # The handler runs for longer than dead_interval. The worker is
+      # alive, so its batch must not be taken over.
+      started = Queue.new
+      cons = Pgque::Consumer.new(dsn, queue: q, name: consumer_n,
+                                 subconsumer: "worker-1", poll_interval: 1,
+                                 dead_interval: "1 second",
+                                 logger: silent_logger)
+      cons.on("evt.long") { |_| started << true; sleep 3 }
+      t = Thread.new { cons.start }
+
+      deadline = Time.now + 5
+      sleep 0.05 until !started.empty? || Time.now >= deadline
+      stolen = []
+      thief = PG.connect(dsn)
+      begin
+        thief_client = Pgque::Client.new(thief)
+        until Time.now >= deadline
+          stolen.concat(thief_client.receive_coop(q, consumer_n, "thief",
+                                                  dead_interval: "1 second"))
+          sleep 0.2
+        end
+      ensure
+        thief.close
+      end
+      cons.stop
+      t.join(5.0)
+
+      refute_empty started
+      assert_equal [], stolen.map(&:msg_id),
+                   "a live worker's batch was taken over"
+    end
+  end
+
+  def test_consumer_coop_takes_over_batch_of_crashed_member
+    with_coop_queue do |q, conn|
+      client = Pgque::Client.new(conn)
+      %w[crashed worker-2].each { |w| client.subscribe_subconsumer(q, consumer_n, w) }
+      msg_id = client.send(q, { "i" => 1 }, type: "evt.crash")
+      tick(conn, q)
+
+      # A member claims the batch and its process dies before acking.
+      dead = PG.connect(dsn)
+      claimed = Pgque::Client.new(dead).receive_coop(q, consumer_n, "crashed")
+      dead.close
+      assert_equal [msg_id], claimed.map(&:msg_id)
+
+      seen = []
+      cons = Pgque::Consumer.new(dsn, queue: q, name: consumer_n,
+                                 subconsumer: "worker-2", poll_interval: 0.5,
+                                 dead_interval: "1 second",
+                                 logger: silent_logger)
+      cons.on("evt.crash") { |m| seen << m.msg_id }
+      t = Thread.new { cons.start }
+
+      deadline = Time.now + 5
+      sleep 0.05 until seen.any? || Time.now >= deadline
+      cons.stop
+      t.join(5.0)
+
+      assert_equal [msg_id], seen
+    end
+  end
+
   def test_consumer_without_subconsumer_unchanged
     with_queue do |queue, c_name, conn|
       client = Pgque::Client.new(conn)
