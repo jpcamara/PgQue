@@ -675,10 +675,12 @@ These objects are not part of [`devel/sql/pgque.sql`](https://github.com/Nikolay
 #### `pgque.send_at(queue text, type text, payload jsonb, deliver_at timestamptz) → bigint`
 
 Schedules delayed delivery. If `deliver_at <= now()` behaves like `insert_event` and returns the queue event id. Otherwise inserts into `pgque.delayed_events` and returns the scheduled-entry id (**not** a queue event id).
+Grant: `pgque_writer`.
 
 #### `pgque.maint_deliver_delayed() → integer`
 
-Moves due rows from `pgque.delayed_events` into their target queues. Intended to be called from `pgque.maint()` (the experimental file overrides `maint()` to chain this in).
+Moves due rows from `pgque.delayed_events` into their target queues. Called from `pgque.maint()`: the experimental file replaces `maint()` with the default one plus this step.
+Grant: `pgque_admin`. `pgque.delayed_events` is readable by `pgque_reader`.
 
 ### [`devel/sql/experimental/observability.sql`](https://github.com/NikolayS/pgque/blob/main/devel/sql/experimental/observability.sql)
 

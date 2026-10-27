@@ -128,3 +128,24 @@ begin
   perform pgque.drop_queue('test_maint_delayed');
   raise notice 'PASS: pgque.maint() delivers delayed events';
 end $$;
+
+-- Test 5: grants. The install's blanket revoke from PUBLIC runs before
+-- this file, so the file revokes its own functions.
+do $$
+begin
+  assert not has_function_privilege('public', 'pgque.send_at(text, text, jsonb, timestamptz)', 'execute'),
+    'PUBLIC must not execute send_at';
+  assert not has_function_privilege('public', 'pgque.maint_deliver_delayed()', 'execute'),
+    'PUBLIC must not execute maint_deliver_delayed';
+  assert not has_function_privilege('public', 'pgque.maint()', 'execute'),
+    'PUBLIC must not execute maint';
+  assert has_function_privilege('pgque_writer', 'pgque.send_at(text, text, jsonb, timestamptz)', 'execute'),
+    'pgque_writer executes send_at';
+  assert not has_function_privilege('pgque_writer', 'pgque.maint_deliver_delayed()', 'execute'),
+    'pgque_writer must not execute maint_deliver_delayed';
+  assert has_function_privilege('pgque_admin', 'pgque.maint_deliver_delayed()', 'execute'),
+    'pgque_admin executes maint_deliver_delayed';
+  assert has_function_privilege('pgque_admin', 'pgque.maint()', 'execute'),
+    'pgque_admin executes maint';
+  raise notice 'PASS: delayed.sql functions are not executable by PUBLIC';
+end $$;
