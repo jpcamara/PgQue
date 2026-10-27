@@ -9,6 +9,11 @@
 \echo 'Running: test_api_delayed'
 \i tests/test_api_delayed.sql
 
+-- delayed.sql replaces maint(); it must keep the default's ownership
+-- check on extra maintenance functions.
+\echo 'Running: test_security_extra_maint (with delayed.sql maint)'
+\i tests/test_security_extra_maint.sql
+
 \echo 'Running: test_observability'
 \i tests/test_observability.sql
 

@@ -70,34 +70,59 @@ $$ language plpgsql security definer set search_path = pgque, pg_catalog;
 
 -- maint() -- top-level maintenance wrapper
 --
--- Calls PgQ's maint_operations() (rotation, retry) and also
--- runs maint_deliver_delayed() for delayed event delivery.
+-- The default pgque.maint() (pgque-api/maint.sql) plus delayed event
+-- delivery. Keep the rest identical to the default, including its
+-- ownership check on extra maintenance functions: loading this file
+-- replaces the default.
 --
--- IMPORTANT: rotation step2 and VACUUM are skipped here.
---
--- Step2 MUST run in a separate transaction from step1 (PgQ design
--- requirement). pgque.start() schedules step2 as its own pg_cron job.
---
--- VACUUM is skipped because autovacuum handles the small metadata
--- tables, and event tables use TRUNCATE rotation (no dead tuples).
+-- Rotation step2 and VACUUM are skipped, as in the default: step2 must
+-- run in a separate transaction (pgque.start() schedules it as its own
+-- pg_cron job), and autovacuum handles the metadata tables.
 create or replace function pgque.maint()
 returns integer as $$
 declare
     f record;
-    sql text;
     r integer;
     total integer := 0;
+    -- Owner of this function (the install owner / SECURITY DEFINER principal).
+    v_maint_owner name;
+    v_func_owner  name;
+    v_func_oid    oid;
 begin
-    -- Run PgQ maintenance operations (rotation step1, retry)
-    -- Skip step2 (needs separate TX) and vacuum (autovacuum handles it)
+    -- Resolve install-owner name once per call (pg_get_userbyid avoids pg_authid).
+    select pg_catalog.pg_get_userbyid(p.proowner) into v_maint_owner
+    from pg_proc p
+    join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'pgque'
+      and p.proname = 'maint'
+      and pg_catalog.pg_get_function_arguments(p.oid) = '';
+
     for f in select func_name, func_arg from pgque.maint_operations()
     loop
         if f.func_name = 'pgque.maint_rotate_tables_step2' then
-            -- Step2 runs in a separate pg_cron job (pgque_rotate_step2)
             continue;
         elsif f.func_name = 'vacuum' then
             continue;
         elsif f.func_arg is not null then
+            -- Resolve to regprocedure; invalid names raise a catchable exception.
+            begin
+                execute format('select %L::regprocedure', f.func_name || '(text)')
+                into v_func_oid;
+            exception when others then
+                raise warning 'pgque.maint: skipping % — invalid regprocedure: %', f.func_name, sqlerrm;
+                continue;
+            end;
+
+            -- Ownership check: extra-maint function must be owned by the install owner.
+            select pg_catalog.pg_get_userbyid(p.proowner) into v_func_owner
+            from pg_proc p
+            where p.oid = v_func_oid;
+
+            if v_func_owner is distinct from v_maint_owner then
+                raise warning 'pgque.maint: skipping % — owner % is not maint() owner %', f.func_name, v_func_owner, v_maint_owner;
+                continue;
+            end if;
+
             execute 'select ' || f.func_name || '(' || quote_literal(f.func_arg) || ')' into r;
             total := total + r;
         else
@@ -113,3 +138,16 @@ begin
     return total;
 end;
 $$ language plpgsql security definer set search_path = pgque, pg_catalog;
+
+-- The install's blanket revoke from PUBLIC ran before this file, and new
+-- functions are executable by PUBLIC by default. send_at is a producer
+-- call; delivery and maint() stay with pgque_admin, which has execute on
+-- all functions.
+revoke execute on function pgque.send_at(text, text, jsonb, timestamptz) from public;
+revoke execute on function pgque.maint_deliver_delayed() from public;
+revoke execute on function pgque.maint() from public;
+grant execute on function pgque.send_at(text, text, jsonb, timestamptz) to pgque_writer;
+grant execute on function pgque.maint_deliver_delayed() to pgque_admin;
+grant execute on function pgque.maint() to pgque_admin;
+revoke all on table pgque.delayed_events from public;
+grant select on table pgque.delayed_events to pgque_reader;
