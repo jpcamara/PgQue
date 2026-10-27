@@ -151,5 +151,8 @@
 \echo 'Running: test_send_idem'
 \i tests/test_send_idem.sql
 
+\echo 'Running: test_is_processed'
+\i tests/test_is_processed.sql
+
 \echo ''
 \echo '=== ALL TESTS PASSED ==='

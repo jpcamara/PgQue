@@ -444,6 +444,25 @@ Inspects an active batch. Grant: `pgque_reader`. Source: [`devel/sql/pgque.sql`]
 | `seq_start`       | `bigint`      |
 | `seq_end`         | `bigint`      |
 
+#### `pgque.is_processed(queue text, consumer text, txid xid8) → boolean`
+
+Whether the consumer has processed (acked or nacked) every event that transaction `txid` sent to the queue. Capture the id in the sending transaction with `pg_current_xact_id()`, then check it later, for example to wait until your own sends have been handled. Writes nothing per event: a consumer's cursor only moves past a tick once the batch ending there is finished, and the tick's snapshot says which transactions it covers.
+
+For a cooperative consumer, pass the main consumer name: a batch counts only once every earlier batch held by a subconsumer is finished too. For a partitioned consumer, pass the base name: it counts once every slot has finished, and is `false` until all slots are subscribed. A nacked event counts as processed; its retry is a new event inserted by `maint_retry_events()`. Raises if the queue doesn't exist or a non-partitioned consumer isn't subscribed.
+Grant: `pgque_reader`, `pgque_writer`. Source: [`devel/sql/pgque-api/processed.sql`](https://github.com/NikolayS/pgque/blob/main/devel/sql/pgque-api/processed.sql).
+
+```sql
+-- in the sending transaction
+select pgque.send('orders', 'order.created', '{"id": 42}'::jsonb), pg_current_xact_id();
+-- later
+select pgque.is_processed('orders', 'order_worker', '12345'::xid8);
+```
+
+#### `pgque.processed_snapshot(queue text, consumer text) → pg_snapshot`
+
+The snapshot behind `is_processed`: a transaction's events are processed once it is visible in it (`pg_visible_in_snapshot`). Useful for checking many transaction ids in one query. `NULL` for a partitioned consumer until all its slots are subscribed.
+Grant: `pgque_reader`, `pgque_writer`. Source: [`devel/sql/pgque-api/processed.sql`](https://github.com/NikolayS/pgque/blob/main/devel/sql/pgque-api/processed.sql).
+
 ## Dead letter queue
 
 PgQ has a retry queue but no dead letter queue; PgQue adds one. Messages land here when `nack()` is called and `retry_count >= max_retries`.
@@ -641,8 +660,8 @@ This is intentional, by design. The batch-ID-based primitives (`ack`, `nack`, `e
 
 | Role           | Functions granted (direct)                                                                                                                                                                                                                                              |
 |----------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `pgque_reader` | `get_queue_info()`, `get_queue_info(text)`, `get_consumer_info()`, `get_consumer_info(text)`, `get_consumer_info(text, text)`, `get_batch_info(bigint)`, `version()`, `dlq_inspect(text, int)`; `select` on all tables incl. `pgque.dead_letter`; consumer primitives (`register_consumer`, `register_consumer_at`, `unregister_consumer`, `next_batch`, `next_batch_info`, `next_batch_custom`, `get_batch_events`, `finish_batch`, `event_retry` int + timestamptz); modern consume API (`subscribe`, `unsubscribe`, `receive`, `ack`, `nack`); experimental cooperative API (`register_subconsumer`, `unregister_subconsumer`, `subscribe_subconsumer`, `unsubscribe_subconsumer`, cooperative `next_batch`, cooperative `next_batch_custom`, `receive_coop`, `touch_subconsumer`)                        |
-| `pgque_writer` | `insert_event` (3, 7), all `send*`, all `send_batch*`, `dlq_replay`, `dlq_replay_all`. **Does not inherit `pgque_reader`** — a producer-only role cannot ack/finish/inspect consumer batches. |
+| `pgque_reader` | `get_queue_info()`, `get_queue_info(text)`, `get_consumer_info()`, `get_consumer_info(text)`, `get_consumer_info(text, text)`, `get_batch_info(bigint)`, `version()`, `dlq_inspect(text, int)`, `is_processed`, `processed_snapshot`; `select` on all tables incl. `pgque.dead_letter`; consumer primitives (`register_consumer`, `register_consumer_at`, `unregister_consumer`, `next_batch`, `next_batch_info`, `next_batch_custom`, `get_batch_events`, `finish_batch`, `event_retry` int + timestamptz); modern consume API (`subscribe`, `unsubscribe`, `receive`, `ack`, `nack`); experimental cooperative API (`register_subconsumer`, `unregister_subconsumer`, `subscribe_subconsumer`, `unsubscribe_subconsumer`, cooperative `next_batch`, cooperative `next_batch_custom`, `receive_coop`, `touch_subconsumer`)                        |
+| `pgque_writer` | `insert_event` (3, 7), all `send*`, all `send_batch*`, `dlq_replay`, `dlq_replay_all`, `is_processed`, `processed_snapshot`. **Does not inherit `pgque_reader`** — a producer-only role cannot ack/finish/inspect consumer batches. |
 | `pgque_admin`  | Member of both `pgque_reader` and `pgque_writer`, plus `event_dead`, `dlq_purge`, `all` on `pgque` schema, `all` on all tables and sequences, `execute` on all functions — **except** `uninstall()` and internal `insert_event_bulk()` which are explicitly revoked                                                            |
 
 `pgque.uninstall()` is revoked from both `pgque_admin` (explicitly) and PUBLIC (via the schema-wide blanket revoke). Internal `pgque.insert_event_bulk()` is also revoked from `pgque_admin`; callers must use `send_batch()` wrappers. Only the schema/install owner (typically a superuser) can run `uninstall()` or the internal primitive directly. All other functions not listed in the table above retain `execute` only for `pgque_admin` (the schema-wide blanket revoke from PUBLIC applies, and `pgque_admin` is granted `execute on all functions`) — notably the lifecycle helpers `start`, `stop`, `status`, `maint`, `maint_retry_events`, `ticker`, `force_next_tick` (and its alias `force_tick`), and the queue-management helpers `create_queue`, `drop_queue`, `set_queue_config`. Grant these explicitly to additional roles if your policy demands it.
