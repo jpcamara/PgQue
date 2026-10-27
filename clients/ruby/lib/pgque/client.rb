@@ -228,7 +228,7 @@ module Pgque
         type: row[2],
         payload: parse_jsonb(row[3]),
         retry_count: row[4].nil? ? nil : row[4].to_i,
-        created_at: row[5].nil? ? nil : Time.parse(row[5]),
+        created_at: row[5],
         extra1: row[6],
         extra2: row[7],
         extra3: row[8],

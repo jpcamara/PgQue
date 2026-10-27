@@ -2,8 +2,11 @@
 
 module Pgque
   class Message
+    TIMESTAMP_DECODER = PG::TextDecoder::TimestampWithTimeZone.new
+    private_constant :TIMESTAMP_DECODER
+
     attr_reader :msg_id, :batch_id, :type, :payload, :retry_count,
-                :created_at, :extra1, :extra2, :extra3, :extra4
+                :extra1, :extra2, :extra3, :extra4
 
     def initialize(msg_id:, batch_id:, type:, payload:, retry_count:,
                    created_at:, extra1: nil, extra2: nil, extra3: nil,
@@ -18,6 +21,13 @@ module Pgque
       @extra2 = extra2
       @extra3 = extra3
       @extra4 = extra4
+    end
+
+    # Client hands over created_at as Postgres timestamptz text, decoded
+    # on first read: most consumers never read it.
+    def created_at
+      @created_at = TIMESTAMP_DECODER.decode(@created_at) if @created_at.is_a?(String)
+      @created_at
     end
   end
 end
