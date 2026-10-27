@@ -16,14 +16,14 @@ module Pgque
     private_constant :NackFailed
 
     attr_reader :dsn, :queue, :name, :poll_interval, :max_messages,
-                :retry_after, :subconsumer, :dead_interval
+                :retry_after, :subconsumer, :dead_interval, :threads
 
     attr_accessor :logger
 
     def initialize(dsn, queue:, name:, poll_interval: 30,
                    max_messages: DEFAULT_MAX_MESSAGES, retry_after: 60,
                    unknown_handler_policy: "nack", subconsumer: nil,
-                   dead_interval: nil, logger: nil)
+                   dead_interval: nil, threads: 1, logger: nil)
       @dsn = dsn
       @queue = queue
       @name = name
@@ -45,6 +45,12 @@ module Pgque
       end
       @subconsumer = subconsumer
       @dead_interval = dead_interval || (subconsumer && DEFAULT_DEAD_INTERVAL)
+
+      unless threads.is_a?(Integer) && threads >= 1
+        raise ArgumentError, "threads must be an Integer >= 1, got #{threads.inspect}"
+      end
+      @threads = threads
+      @after_ack = nil
 
       @handlers = {}
       @default_handler = nil
@@ -68,6 +74,14 @@ module Pgque
         @handlers[event_type] = block
       end
       block
+    end
+
+    # Runs the block after each batch is acked, with the batch id and its
+    # messages. An error in it is logged; the batch stays acked.
+    def after_ack(&block)
+      raise ArgumentError, "block required for Consumer#after_ack" unless block
+
+      @after_ack = block
     end
 
     def start
@@ -180,6 +194,7 @@ module Pgque
           )
         end
       end
+      run_after_ack(batch_id, msgs)
       true
     rescue NackFailed
       false
@@ -188,39 +203,63 @@ module Pgque
     private
 
     # Runs the handlers and returns the messages to nack, each with the
-    # nack reason (nil for a handler error).
+    # nack reason (nil for a handler error). With threads > 1, the
+    # messages run on that many threads, and the batch is done when they
+    # all finish.
     def dispatch_batch(msgs)
-      failures = []
-      msgs.each do |msg|
-        handler = @handlers[msg.type] || @default_handler
+      return msgs.filter_map { |msg| dispatch(msg) } if @threads == 1 || msgs.size == 1
 
-        if handler.nil?
-          if @unknown_handler_policy == "ack"
-            @logger.warn(
-              "no handler for event type=#{msg.type} ev_id=#{msg.msg_id}; " \
-              "acking",
-            )
-            next
+      pending = Queue.new
+      msgs.each { |msg| pending << msg }
+      pending.close
+      failures = Queue.new
+      Array.new([@threads, msgs.size].min) do
+        Thread.new do
+          while (msg = pending.pop)
+            failure = dispatch(msg)
+            failures << failure if failure
           end
+        end
+      end.each(&:join)
+      Array.new(failures.size) { failures.pop }
+    end
+
+    # Runs the handler for one message. Returns [msg, reason] if the
+    # message is to be nacked.
+    def dispatch(msg)
+      handler = @handlers[msg.type] || @default_handler
+
+      if handler.nil?
+        if @unknown_handler_policy == "ack"
           @logger.warn(
             "no handler for event type=#{msg.type} ev_id=#{msg.msg_id}; " \
-            "nacking",
+            "acking",
           )
-          failures << [msg, "no handler for type=#{msg.type}"]
-          next
+          return
         end
-
-        begin
-          handler.call(msg)
-        rescue StandardError => e
-          @logger.error(
-            "handler failed for msg_id=#{msg.msg_id}: " \
-            "#{e.class}: #{e.message}",
-          )
-          failures << [msg, nil]
-        end
+        @logger.warn(
+          "no handler for event type=#{msg.type} ev_id=#{msg.msg_id}; " \
+          "nacking",
+        )
+        return [msg, "no handler for type=#{msg.type}"]
       end
-      failures
+
+      begin
+        handler.call(msg)
+        nil
+      rescue StandardError => e
+        @logger.error(
+          "handler failed for msg_id=#{msg.msg_id}: " \
+          "#{e.class}: #{e.message}",
+        )
+        [msg, nil]
+      end
+    end
+
+    def run_after_ack(batch_id, msgs)
+      @after_ack&.call(batch_id, msgs)
+    rescue StandardError => e
+      @logger.error("after_ack failed for batch #{batch_id}: #{e.class}: #{e.message}")
     end
 
     # The claimed batch is committed before the handlers run, so a crashed

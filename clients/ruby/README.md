@@ -105,6 +105,20 @@ instance; the default targets `$stderr` at `FATAL`, so the consumer is
 effectively silent unless you set `PGQUE_LOG_LEVEL=warn` or pass your
 own).
 
+`threads:` (default 1) runs the messages of a batch on that many
+threads. The batch is acked once they have all finished, so handlers
+must be thread-safe.
+
+`after_ack` registers a block to run after each batch is acked, with the
+batch id and its messages. An error in it is logged, and the batch stays
+acked.
+
+```ruby
+consumer = Pgque::Consumer.new(dsn, queue: "orders", name: "order_worker", threads: 8)
+consumer.on("order.created") { |msg| process_order(msg.payload) }
+consumer.after_ack { |batch_id, msgs| record_progress(batch_id, msgs.size) }
+```
+
 ### Handling unknown event types
 
 By default the consumer **nacks** any message whose type has no
