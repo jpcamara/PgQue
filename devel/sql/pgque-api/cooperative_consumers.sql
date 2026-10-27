@@ -1125,52 +1125,55 @@ begin
         raise exception 'pgque.receive_coop: max_return must be >= 1, got %', i_max_return;
     end if;
 
-    v_batch_id := pgque.next_batch(i_queue, i_consumer, i_subconsumer, i_dead_interval);
-    if v_batch_id is null then
-        return;
-    end if;
-
-    for ev in
-        select
-            ev_id,
-            ev_type,
-            ev_data,
-            ev_retry,
-            ev_time,
-            ev_extra1,
-            ev_extra2,
-            ev_extra3,
-            ev_extra4
-        from pgque.get_batch_events(v_batch_id)
     loop
-        if cnt = i_max_return then
-            raise exception 'pgque.receive_coop: batch exceeds max_return of %', i_max_return
-                using
-                    errcode = '54000',
-                    hint = 'Retry with a larger resource-safe max_return to receive the complete batch. Do not acknowledge after this error.';
+        v_batch_id := pgque.next_batch(i_queue, i_consumer, i_subconsumer, i_dead_interval);
+        if v_batch_id is null then
+            return;
         end if;
-        return next row(
-            ev.ev_id,
-            v_batch_id,
-            ev.ev_type,
-            ev.ev_data,
-            ev.ev_retry,
-            ev.ev_time,
-            ev.ev_extra1,
-            ev.ev_extra2,
-            ev.ev_extra3,
-            ev.ev_extra4
-        )::pgque.message;
-        cnt := cnt + 1;
-    end loop;
 
-    -- Empty batch: release the member token so the subconsumer is not wedged
-    -- on a tick window with no visible events. finish_batch on a coop_member
-    -- clears sub_batch + sub_last_tick + sub_next_tick (it does not advance
-    -- the main cursor, which already moved when the batch was allocated).
-    if cnt = 0 then
+        for ev in
+            select
+                ev_id,
+                ev_type,
+                ev_data,
+                ev_retry,
+                ev_time,
+                ev_extra1,
+                ev_extra2,
+                ev_extra3,
+                ev_extra4
+            from pgque.get_batch_events(v_batch_id)
+        loop
+            if cnt = i_max_return then
+                raise exception 'pgque.receive_coop: batch exceeds max_return of %', i_max_return
+                    using
+                        errcode = '54000',
+                        hint = 'Retry with a larger resource-safe max_return to receive the complete batch. Do not acknowledge after this error.';
+            end if;
+            return next row(
+                ev.ev_id,
+                v_batch_id,
+                ev.ev_type,
+                ev.ev_data,
+                ev.ev_retry,
+                ev.ev_time,
+                ev.ev_extra1,
+                ev.ev_extra2,
+                ev.ev_extra3,
+                ev.ev_extra4
+            )::pgque.message;
+            cnt := cnt + 1;
+        end loop;
+        exit when cnt > 0;
+
+        -- Empty batch: release the member token so the subconsumer is not
+        -- wedged on a tick window with no visible events, and move on to
+        -- the next batch, as receive() does. finish_batch on a coop_member
+        -- clears sub_batch + sub_last_tick + sub_next_tick (it does not
+        -- advance the main cursor, which already moved when the batch was
+        -- allocated).
         perform pgque.finish_batch(v_batch_id);
-    end if;
+    end loop;
 
     return;
 end;
