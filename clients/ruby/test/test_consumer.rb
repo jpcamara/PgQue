@@ -102,6 +102,14 @@ class TestConsumerUnit < Minitest::Test
     end
   end
 
+  def test_consumer_rejects_invalid_threads
+    [0, -1, 1.5, "2"].each do |threads|
+      assert_raises(ArgumentError) do
+        Pgque::Consumer.new("dummy", queue: "q", name: "c", threads: threads)
+      end
+    end
+  end
+
   def test_consumer_dead_interval_without_subconsumer_raises
     skip_dsn_for_this_class!
     assert_raises(ArgumentError) do
@@ -447,6 +455,129 @@ class TestConsumerIntegration < Minitest::Test
       refute_includes ids, ok1
       refute_includes ids, ok2
       client.ack(follow[0].batch_id) if follow.any?
+    end
+  end
+
+  def test_consumer_threads_run_a_batch_concurrently
+    with_queue do |queue, consumer_n, conn|
+      client = Pgque::Client.new(conn)
+      6.times { |i| client.send(queue, { "i" => i }, type: "evt") }
+      force_tick(conn, queue)
+
+      lock = Mutex.new
+      running = 0
+      peak = 0
+      seen = Queue.new
+      cons = Pgque::Consumer.new(dsn, queue: queue, name: consumer_n,
+                                 threads: 3, logger: silent_logger)
+      cons.on("evt") do |m|
+        lock.synchronize { peak = [peak, running += 1].max }
+        sleep 0.2
+        lock.synchronize { running -= 1 }
+        seen << m.payload["i"]
+      end
+
+      assert cons.poll_once(conn)
+      assert_equal 3, peak
+      assert_equal (0..5).to_a, Array.new(seen.size) { seen.pop }.sort
+    end
+  end
+
+  def test_consumer_threads_nack_failed_messages_only
+    with_queue do |queue, consumer_n, conn|
+      client = Pgque::Client.new(conn)
+      ok = Array.new(3) { |i| client.send(queue, { "i" => i }, type: "ok") }
+      boom = Array.new(2) { |i| client.send(queue, { "i" => i }, type: "boom") }
+      force_tick(conn, queue)
+
+      cons = Pgque::Consumer.new(dsn, queue: queue, name: consumer_n,
+                                 threads: 4, retry_after: 3600,
+                                 logger: silent_logger)
+      cons.on("ok") { |_| }
+      cons.on("boom") { |_| raise "handler boom" }
+
+      assert cons.poll_once(conn)
+      boom.each { |id| assert_equal 1, retry_count_for_msg(conn, queue, id) }
+      ok.each { |id| assert_equal 0, retry_count_for_msg(conn, queue, id) }
+    end
+  end
+
+  def test_consumer_after_ack_runs_once_the_batch_is_acked
+    with_queue do |queue, consumer_n, conn|
+      client = Pgque::Client.new(conn)
+      ids = Array.new(2) { |i| client.send(queue, { "i" => i }, type: "evt") }
+      force_tick(conn, queue)
+
+      calls = []
+      cons = Pgque::Consumer.new(dsn, queue: queue, name: consumer_n,
+                                 logger: silent_logger)
+      cons.on("evt") { |_| }
+      cons.after_ack do |batch_id, msgs|
+        open_batch = PG.connect(dsn).then do |other|
+          other.exec_params(
+            "select s.sub_batch from pgque.subscription s " \
+            "join pgque.queue q on q.queue_id = s.sub_queue " \
+            "join pgque.consumer c on c.co_id = s.sub_consumer " \
+            "where q.queue_name = $1 and c.co_name = $2",
+            [queue, consumer_n],
+          ).getvalue(0, 0).tap { other.close }
+        end
+        calls << [batch_id, msgs.map(&:msg_id), open_batch]
+      end
+
+      assert cons.poll_once(conn)
+      assert_equal 1, calls.size
+      batch_id, msg_ids, open_batch = calls.first
+      assert_kind_of Integer, batch_id
+      assert_equal ids.sort, msg_ids.sort
+      assert_nil open_batch, "after_ack must run after the ack commits"
+    end
+  end
+
+  def test_consumer_after_ack_error_is_logged_and_batch_stays_acked
+    with_queue do |queue, consumer_n, conn|
+      client = Pgque::Client.new(conn)
+      client.send(queue, { "i" => 1 }, type: "evt")
+      force_tick(conn, queue)
+
+      log, io = capturing_logger
+      cons = Pgque::Consumer.new(dsn, queue: queue, name: consumer_n,
+                                 logger: log)
+      cons.on("evt") { |_| }
+      cons.after_ack { |_, _| raise "hook boom" }
+
+      assert cons.poll_once(conn)
+      assert_match(/after_ack failed for batch \d+: RuntimeError: hook boom/, io.string)
+      force_tick(conn, queue)
+      assert_empty client.receive(queue, consumer_n, 10)
+    end
+  end
+
+  def test_consumer_start_keeps_its_threads_between_batches
+    with_queue do |queue, consumer_n, conn|
+      client = Pgque::Client.new(conn)
+      2.times do |batch|
+        4.times { |i| client.send(queue, { "i" => i }, type: "evt") }
+        force_tick(conn, queue) if batch == 0
+      end
+      threads_before = Thread.list.size
+
+      seen = Queue.new
+      cons = Pgque::Consumer.new(dsn, queue: queue, name: consumer_n,
+                                 poll_interval: 1, threads: 3,
+                                 logger: silent_logger)
+      cons.on("evt") { |_| seen << Thread.current }
+      runner = Thread.new { cons.start }
+      sleep 0.1 until seen.size == 4
+      force_tick(conn, queue)
+      sleep 0.1 until seen.size == 8
+      cons.stop
+      runner.join(5)
+
+      handler_threads = Array.new(seen.size) { seen.pop }.uniq
+      assert_operator handler_threads.size, :<=, 3
+      refute_includes handler_threads, runner
+      assert_equal threads_before, Thread.list.size
     end
   end
 end
